@@ -1,0 +1,22 @@
+{
+  "name": "kakaotalk-hook",
+  "version": "1.0.0",
+  "description": "KakaoTalk Frida hooking tool with ADB device management",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "setup": "node -e \"import('./setup.js').then(m => m.runSetup())\""
+  },
+  "dependencies": {
+    "bson": "^7.2.0",
+    "frida": "^16.6.6",
+    "inquirer": "^12.3.2",
+    "lzma-native": "^8.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

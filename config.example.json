@@ -1,0 +1,31 @@
+{
+  "adbPath": "C:\\path\\to\\platform-tools\\adb.exe",
+  "deviceSerial": "",
+  "fridaServerPath": "",
+  "logLevel": "info",
+  "scripts": {
+    "anti-detect":   { "enabled": true,  "logLevel": "info" },
+    "anti-kill":     { "enabled": true,  "logLevel": "info" },
+    "nfilter":       { "enabled": true,  "logLevel": "info" },
+    "device-spoof":  { "enabled": true,  "logLevel": "info" },
+    "activity":      { "enabled": true,  "logLevel": "info" },
+    "sharedpref":    { "enabled": true,  "logLevel": "info" },
+    "kakaotalk-app": { "enabled": true,  "logLevel": "info" },
+    "loco-monitor":  { "enabled": true,  "logLevel": "info" },
+    "http-monitor":  { "enabled": true,  "logLevel": "debug" }
+  },
+  "deviceSpoof": {
+    "model":        "SM-S928N",
+    "manufacturer": "samsung",
+    "brand":        "samsung",
+    "device":       "e3q",
+    "product":      "e3qks",
+    "hardware":     "qcom",
+    "board":        "sun",
+    "fingerprint":  "samsung/e3qks/e3q:14/UP1A.231005.007/S928NKSS3AXL2:user/release-keys",
+    "display":      "UP1A.231005.007.S928NKSS3AXL2",
+    "androidId":    null,
+    "carrier":      "SKTelecom",
+    "mccMnc":       "45005"
+  }
+}
