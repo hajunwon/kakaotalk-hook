@@ -17,14 +17,14 @@ Frida hooking toolkit and TypeScript client library for KakaoTalk, based on reve
 ├── config.js               # JSON-based config loader
 ├── setup.js                # Interactive config wizard
 ├── adb/                    # ADB device management
-│   ���── device-manager.js   # Device listing / selection / shell
+│   ├── device-manager.js   # Device listing / selection / shell
 │   ├── frida-server.js     # frida-server download & deployment
-���   └── xapk-installer.js   # XAPK/APK installation
+│   └── xapk-installer.js   # XAPK/APK installation
 ├── frida/                  # Frida scripts
 │   ├── script-manager.js   # Script loading & session management
 │   └── scripts/
 │       ├── bypass/         # Anti-detection, process protection, device spoofing
-│       └─��� hooks/          # HTTP/LOCO monitoring, Activity/SharedPref hooks
+│       └── hooks/          # HTTP/LOCO monitoring, Activity/SharedPref hooks
 └── src/                    # TypeScript client library
     ├── client.ts           # KakaoClient (login, messaging)
     ├── auth.ts             # HTTP auth (email/password login, device registration)
