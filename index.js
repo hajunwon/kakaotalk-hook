@@ -1,6 +1,6 @@
 import inquirer from 'inquirer';
 import { loadConfig } from './config.js';
-import { runSetup } from './setup.js';
+import { runSetup, editConfig } from './setup.js';
 import { listDevices, selectDevice } from './adb/device-manager.js';
 import { deployAndStart, stopServer } from './adb/frida-server.js';
 import { spawnAndHook, attachAndHook } from './frida/script-manager.js';
@@ -89,6 +89,7 @@ async function main() {
       type: 'list',
       name: 'action',
       message: '작업을 선택하세요:',
+      pageSize: 20,
       choices: [
         { name: '1. 디바이스 목록 보기', value: 'devices' },
         { name: '2. APK/XAPK/Split APK 설치', value: 'apk' },
@@ -110,7 +111,7 @@ async function main() {
         case 'spawn': await hookSpawn(); break;
         case 'attach': await hookAttach(); break;
         case 'stop': await stopFrida(); break;
-        case 'setup': await runSetup(); break;
+        case 'setup': await editConfig(); break;
         case 'exit': process.exit(0);
       }
     } catch (err) {
