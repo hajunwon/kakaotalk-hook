@@ -1,8 +1,15 @@
-// loco-monitor.js - LOCO 프로토콜 패킷 모니터링 (순수 Java reflection 버전)
+// loco-monitor.js - LOCO 프로토콜 패킷 모니터링 (순수 runtime discovery)
 //
-// R8 난독화로 필드/메서드 이름이 전부 충돌 (a~h)
-// → Frida wrapper의 .method() 호출 전부 불가
-// → 해결: 모든 호출을 java.lang.reflect.Method.invoke()로 수행
+// 전략: LocoJob(unobfuscated) 한 곳에서 모든 관련 타입을 역추적
+//   1. LocoJob.f(X, Continuation) → X = LocoReq 클래스
+//   2. LocoJob.v(Y) → Y = LocoRes 클래스
+//   3. LocoRes.getSuperclass() → AbstractLocoPacket (header+body 필드 보유)
+//   4. AbstractLocoPacket 필드 2개:
+//        - 타입이 (int+short+Enum+int) 필드를 가진 것 = LocoHeader
+//        - 나머지 비-primitive = LocoBody
+//   5. LocoBody의 첫 non-static 필드 = BSON (Map 구현체)
+//
+// R8가 패키지/클래스명을 pr → xx 로 바꿔도 LocoJob만 살아있으면 전부 작동.
 
 var _locoInstalled = false;
 
@@ -26,10 +33,9 @@ function installLocoMonitor() {
     var _enumNameMethod = null;
     try { _enumNameMethod = Java.use('java.lang.Enum').class.getMethod('name'); } catch (_) {}
 
-    var _intValueMethod = null, _longValueMethod = null, _shortValueMethod = null;
+    var _intValueMethod = null, _longValueMethod = null;
     try { _intValueMethod = Java.use('java.lang.Number').class.getMethod('intValue'); } catch (_) {}
     try { _longValueMethod = Java.use('java.lang.Number').class.getMethod('longValue'); } catch (_) {}
-    try { _shortValueMethod = Java.use('java.lang.Number').class.getMethod('shortValue'); } catch (_) {}
 
     var _booleanValueMethod = null;
     try { _booleanValueMethod = Java.use('java.lang.Boolean').class.getMethod('booleanValue'); } catch (_) {}
@@ -37,7 +43,7 @@ function installLocoMonitor() {
     var _Modifier = null;
     try { _Modifier = Java.use('java.lang.reflect.Modifier'); } catch (_) {}
 
-    function isStaticField(f) {
+    function isStatic(f) {
         if (!_Modifier) return false;
         try { return _Modifier.isStatic(f.getModifiers()); } catch (_) { return false; }
     }
@@ -65,137 +71,276 @@ function installLocoMonitor() {
         return -1;
     }
 
-    function toBool(javaObj) {
-        if (typeof javaObj === 'boolean') return javaObj;
-        if (javaObj == null) return false;
-        try { if (_booleanValueMethod) return !!_booleanValueMethod.invoke(javaObj); } catch (_) {}
-        try { return String(javaObj) === 'true'; } catch (_) {}
-        return false;
+    function toBool(v) {
+        if (typeof v === 'boolean') return v;
+        if (v == null) return false;
+        try { if (_booleanValueMethod) return !!_booleanValueMethod.invoke(v); } catch (_) {}
+        return String(v) === 'true';
+    }
+
+    function isJavaKotlin(name) {
+        return name.indexOf('java.') === 0 || name.indexOf('kotlin.') === 0 || name.indexOf('kotlinx.') === 0;
     }
 
     // ==============================================================
-    // reflection 메서드 찾기 (캐시)
+    // Java Map/List 인터페이스 캐시 (R8 충돌 회피)
     // ==============================================================
-    var _reflCache = {};
-
-    function findMethod0(obj, name, retHint) {
-        var cls = obj.getClass();
-        var key = cls.getName() + ':' + name + ':' + (retHint || '');
-        if (_reflCache[key] !== undefined) return _reflCache[key];
-
-        // getDeclaredMethods 계층 탐색
-        var cur = cls;
-        for (var d = 0; d < 8 && cur; d++) {
-            try {
-                var ms = cur.getDeclaredMethods();
-                for (var i = 0; i < ms.length; i++) {
-                    if (ms[i].getName() === name && ms[i].getParameterTypes().length === 0) {
-                        if (!retHint || ms[i].getReturnType().getName().indexOf(retHint) >= 0) {
-                            ms[i].setAccessible(true);
-                            _reflCache[key] = ms[i];
-                            return ms[i];
-                        }
-                    }
-                }
-            } catch (_) {}
-            try { cur = cur.getSuperclass(); } catch (_) { break; }
-        }
-        // getMethods (public, interface 포함)
-        try {
-            var pms = cls.getMethods();
-            for (var j = 0; j < pms.length; j++) {
-                if (pms[j].getName() === name && pms[j].getParameterTypes().length === 0) {
-                    if (!retHint || pms[j].getReturnType().getName().indexOf(retHint) >= 0) {
-                        _reflCache[key] = pms[j];
-                        return pms[j];
-                    }
-                }
-            }
-        } catch (_) {}
-
-        _reflCache[key] = null;
-        return null;
-    }
-
-    function invoke0(obj, name, retHint) {
-        if (!obj) return undefined;
-        try { var m = findMethod0(obj, name, retHint); if (m) return m.invoke(obj); } catch (_) {}
-        return undefined;
-    }
-
-    // get(String) 또는 get(Object) 메서드 캐시
-    var _getMethodCache = {};
-    function findGetMethod(obj) {
-        var cn = obj.getClass().getName();
-        if (_getMethodCache[cn] !== undefined) return _getMethodCache[cn];
-        var found = null;
-        try {
-            var ms = obj.getClass().getMethods();
-            for (var i = 0; i < ms.length; i++) {
-                if (ms[i].getName() === 'get') {
-                    var pt = ms[i].getParameterTypes();
-                    if (pt.length === 1) {
-                        var ptn = pt[0].getName();
-                        if (ptn === 'java.lang.String') { found = ms[i]; break; }
-                        if (ptn === 'java.lang.Object' && !found) found = ms[i];
-                    }
-                }
-            }
-        } catch (_) {}
-        _getMethodCache[cn] = found;
-        return found;
-    }
-
-    // ==============================================================
-    // LocoJob.h() 메서드 (LocoMethod enum) — 미리 찾기
-    // ==============================================================
-    var _hMethod = null;
-    try {
-        var ljMs = LocoJobClass.class.getDeclaredMethods();
-        for (var mi = 0; mi < ljMs.length; mi++) {
-            var mm = ljMs[mi];
-            if (mm.getName() === 'h' && mm.getParameterTypes().length === 0) {
-                var rt = mm.getReturnType().getName();
-                var skip = (rt === 'int' || rt === 'short' || rt === 'void' || rt === 'boolean' ||
-                    rt === 'long' || rt === 'byte' || rt.indexOf('java.') === 0 || rt.indexOf('kotlin.') === 0);
-                if (!skip) {
-                    mm.setAccessible(true);
-                    _hMethod = mm;
-                    emitLog(TAG, 'debug', 'h() ret=' + rt);
-                    break;
-                }
-            }
-        }
-    } catch (_) {}
-
-    function getMethodName(job) {
-        if (!_hMethod) return '?';
-        try { var ev = _hMethod.invoke(job); if (ev) { var n = enumName(ev); if (n) return n; } } catch (_) {}
-        return '?';
-    }
-
-    // ==============================================================
-    // iterateMap — Java Map/BSON → JS 객체
-    // Java.cast로 java.util.Map 인터페이스 사용 (R8 충돌 회피)
-    // ==============================================================
-    var _JavaMap = null, _JavaIterator = null, _JavaMapEntry = null, _JavaSet = null;
+    var _JavaMap = null, _JavaIterator = null, _JavaMapEntry = null, _JavaList = null;
     try { _JavaMap = Java.use('java.util.Map'); } catch (_) {}
     try { _JavaIterator = Java.use('java.util.Iterator'); } catch (_) {}
     try { _JavaMapEntry = Java.use('java.util.Map$Entry'); } catch (_) {}
-    try { _JavaSet = Java.use('java.util.Set'); } catch (_) {}
+    try { _JavaList = Java.use('java.util.List'); } catch (_) {}
 
     function isMap(obj) {
-        if (!_JavaMap) return false;
+        if (!_JavaMap || !obj) return false;
         try { return _JavaMap.class.isInstance(obj); } catch (_) { return false; }
     }
 
     function isList(obj) {
-        try { return Java.use('java.util.List').class.isInstance(obj); } catch (_) { return false; }
+        if (!_JavaList || !obj) return false;
+        try { return _JavaList.class.isInstance(obj); } catch (_) { return false; }
+    }
+
+    // ==============================================================
+    // Step 1: LocoJob.f(), LocoJob.v(), LocoJob.n() 메서드 시그니처 스캔
+    // ==============================================================
+    var reqClassName = null;
+    var resClassName = null;
+    var fOverloadParams = null;  // [reqType, continuationType]
+    var vOverloadParam = null;
+    var nOverloadParams = null;  // [resType, Function1]
+    var hMethod = null;          // 메서드명 getter
+
+    try {
+        var ljMs = LocoJobClass.class.getDeclaredMethods();
+        for (var i = 0; i < ljMs.length; i++) {
+            var mm = ljMs[i];
+            var mName = mm.getName();
+            var params = mm.getParameterTypes();
+            var retType = mm.getReturnType().getName();
+
+            // f(Req, Continuation) → send
+            if (mName === 'f' && params.length === 2 &&
+                params[1].getName() === 'kotlin.coroutines.Continuation' &&
+                !isJavaKotlin(params[0].getName())) {
+                reqClassName = params[0].getName();
+                fOverloadParams = [params[0].getName(), params[1].getName()];
+            }
+
+            // v(Res) → void
+            if (mName === 'v' && params.length === 1 &&
+                retType === 'void' && !isJavaKotlin(params[0].getName())) {
+                resClassName = params[0].getName();
+                vOverloadParam = params[0].getName();
+            }
+
+            // n(Res, Function1) → Res
+            if (mName === 'n' && params.length === 2 &&
+                params[1].getName() === 'kotlin.jvm.functions.Function1' &&
+                !isJavaKotlin(params[0].getName())) {
+                nOverloadParams = [params[0].getName(), params[1].getName()];
+                if (!resClassName) resClassName = params[0].getName();
+            }
+
+            // h() → LocoMethod enum
+            if (mName === 'h' && params.length === 0 && !isJavaKotlin(retType) &&
+                retType !== 'void' && retType !== 'int' && retType !== 'long' &&
+                retType !== 'short' && retType !== 'boolean' && retType !== 'byte') {
+                mm.setAccessible(true);
+                hMethod = mm;
+            }
+        }
+    } catch (e) {
+        emitLog(TAG, 'error', 'LocoJob 메서드 스캔 실패: ' + e.message);
+        return;
+    }
+
+    if (!reqClassName && !resClassName) {
+        emitLog(TAG, 'error', 'LocoReq/LocoRes 클래스 추론 실패');
+        return;
+    }
+
+    emitLog(TAG, 'debug', 'discovered req=' + reqClassName + ' res=' + resClassName + ' h()=' + (hMethod ? 'ok' : 'null'));
+
+    // ==============================================================
+    // Step 2: AbstractLocoPacket 추론 (LocoRes or LocoReq의 superclass)
+    // ==============================================================
+    var pktAbstractClassName = null;
+    try {
+        var seedName = resClassName || reqClassName;
+        var seedClass = Java.use(seedName);
+        var parent = seedClass.class.getSuperclass();
+        if (parent) {
+            var parentName = parent.getName();
+            if (parentName !== 'java.lang.Object') {
+                pktAbstractClassName = parentName;
+            }
+        }
+    } catch (e) {
+        emitLog(TAG, 'debug', 'AbstractLocoPacket 추론 실패: ' + e.message);
+    }
+
+    // ==============================================================
+    // Step 3: AbstractLocoPacket의 header/body 필드 식별
+    //   - LocoHeader: (int + short + Enum + int) 필드 보유
+    //   - LocoBody: non-primitive 필드 1개 이상 (BSON 보유)
+    // ==============================================================
+    var _headerField = null;
+    var _bodyField = null;
+    var _bsonField = null;
+    var _headerClassName = null;
+    var _bodyClassName = null;
+
+    function inspectFieldSignature(typeClass) {
+        var sig = { intCount: 0, shortCount: 0, enumCount: 0, other: 0 };
+        try {
+            var fs = typeClass.getDeclaredFields();
+            for (var i = 0; i < fs.length; i++) {
+                if (isStatic(fs[i])) continue;
+                var ft = fs[i].getType();
+                var ftn = ft.getName();
+                if (ftn === 'int') sig.intCount++;
+                else if (ftn === 'short') sig.shortCount++;
+                else {
+                    try {
+                        if (ft.isEnum()) { sig.enumCount++; continue; }
+                    } catch (_) {}
+                    sig.other++;
+                }
+            }
+        } catch (_) {}
+        return sig;
+    }
+
+    if (pktAbstractClassName) {
+        try {
+            var pktClass = Java.use(pktAbstractClassName);
+            var pktFields = pktClass.class.getDeclaredFields();
+            for (var pi = 0; pi < pktFields.length; pi++) {
+                var pf = pktFields[pi];
+                if (isStatic(pf)) continue;
+                pf.setAccessible(true);
+                var ft = pf.getType();
+                var ftName = ft.getName();
+                if (isJavaKotlin(ftName) || ftName.indexOf('[') === 0) continue;
+
+                var sig = inspectFieldSignature(ft);
+                // 헤더: int>=2 + short>=1 + enum>=1
+                if (!_headerField && sig.intCount >= 2 && sig.shortCount >= 1 && sig.enumCount >= 1) {
+                    _headerField = pf;
+                    _headerClassName = ftName;
+                    continue;
+                }
+                // 바디: 비-primitive non-static 1개 이상 (BSON/Map)
+                if (!_bodyField && sig.other >= 1) {
+                    _bodyField = pf;
+                    _bodyClassName = ftName;
+                }
+            }
+        } catch (e) {
+            emitLog(TAG, 'debug', 'AbstractLocoPacket 필드 스캔 실패: ' + e.message);
+        }
+    }
+
+    // Body 안의 BSON 필드 (첫 non-static non-primitive)
+    if (_bodyClassName) {
+        try {
+            var bodyClass = Java.use(_bodyClassName);
+            var bodyFields = bodyClass.class.getDeclaredFields();
+            for (var bi = 0; bi < bodyFields.length; bi++) {
+                var bf = bodyFields[bi];
+                if (isStatic(bf)) continue;
+                bf.setAccessible(true);
+                var bft = bf.getType().getName();
+                if (bft === 'int' || bft === 'long' || bft === 'short' || bft === 'byte' ||
+                    bft === 'float' || bft === 'double' || bft === 'boolean') continue;
+                _bsonField = bf;
+                break;
+            }
+        } catch (e) {
+            emitLog(TAG, 'debug', 'LocoBody 필드 스캔 실패: ' + e.message);
+        }
+    }
+
+    emitLog(TAG, 'debug',
+        'discovered pkt=' + pktAbstractClassName +
+        ' header=' + _headerClassName +
+        ' body=' + _bodyClassName +
+        ' bson=' + (_bsonField ? 'ok' : 'null')
+    );
+
+    // ==============================================================
+    // 메서드 이름 (LocoMethod enum) 조회
+    // ==============================================================
+    function getMethodName(job) {
+        if (!hMethod) return '?';
+        try {
+            var ev = hMethod.invoke(job);
+            if (ev) {
+                var n = enumName(ev);
+                if (n) return n;
+            }
+        } catch (_) {}
+        return '?';
+    }
+
+    // ==============================================================
+    // Java → JS 변환
+    // ==============================================================
+    function javaToJs(obj, depth) {
+        if (obj == null) return null;
+        if (depth > 6) { try { return String(obj); } catch (_) { return '(deep)'; } }
+        var t = typeof obj;
+        if (t === 'number' || t === 'boolean' || t === 'string') return obj;
+
+        var cls;
+        try { cls = obj.getClass().getName(); } catch (_) { try { return String(obj); } catch (_2) { return '(?)'; } }
+
+        if (cls === 'java.lang.Boolean') return toBool(obj);
+        if (cls === 'java.lang.Integer' || cls === 'java.lang.Short' || cls === 'java.lang.Byte') return unboxInt(obj);
+        if (cls === 'java.lang.Long') {
+            var lv = unboxLong(obj);
+            return (lv > 9007199254740991 || lv < -9007199254740991) ? String(obj) : lv;
+        }
+        if (cls === 'java.lang.Double' || cls === 'java.lang.Float') {
+            try { return parseFloat(String(obj)); } catch (_) { return 0; }
+        }
+        if (cls === 'java.lang.String') return String(obj);
+
+        if (cls === '[B') {
+            try {
+                var len = obj.length;
+                var hex = [];
+                for (var bi = 0; bi < Math.min(len, 64); bi++) {
+                    var b = obj[bi] & 0xFF;
+                    hex.push((b < 16 ? '0' : '') + b.toString(16));
+                }
+                return '<bytes[' + len + ']> ' + hex.join(' ') + (len > 64 ? '...' : '');
+            } catch (_) { return '<bytes>'; }
+        }
+
+        if (cls === 'java.util.Date') {
+            try {
+                var getTime = Java.use('java.util.Date').class.getMethod('getTime');
+                return Number(getTime.invoke(obj));
+            } catch (_) { return String(obj); }
+        }
+
+        if (isMap(obj)) {
+            var mapResult = iterateMap(obj, depth);
+            if (mapResult !== null) return mapResult;
+        }
+
+        if (isList(obj)) {
+            var listResult = iterateList(obj, depth);
+            if (listResult !== null) return listResult;
+        }
+
+        try { return String(obj); } catch (_) { return '(obj)'; }
     }
 
     function iterateMap(javaMap, depth) {
         if (!isMap(javaMap)) return null;
-
         var result = {};
         try {
             var map = Java.cast(javaMap, _JavaMap);
@@ -209,15 +354,13 @@ function installLocoMonitor() {
                 result[key] = javaToJs(entry.getValue(), depth + 1);
             }
             return result;
-        } catch (e) {
-            emitLog(TAG, 'debug', 'iterateMap err: ' + e.message);
-        }
+        } catch (_) {}
         return null;
     }
 
     function iterateList(javaList, depth) {
         try {
-            var list = Java.cast(javaList, Java.use('java.util.List'));
+            var list = Java.cast(javaList, _JavaList);
             var sz = list.size();
             var arr = [];
             for (var i = 0; i < Math.min(sz, 100); i++) {
@@ -230,233 +373,53 @@ function installLocoMonitor() {
     }
 
     // ==============================================================
-    // javaToJs — Java 객체 → JS 객체 (재귀)
+    // 패킷 추출 (discovery 기반)
     // ==============================================================
-    function javaToJs(obj, depth) {
-        if (obj == null || obj === undefined) return null;
-        if (depth > 6) { try { return String(obj); } catch (_) { return '(deep)'; } }
-        var t = typeof obj;
-        if (t === 'number' || t === 'boolean' || t === 'string') return obj;
-
-        var cls;
-        try { cls = obj.getClass().getName(); } catch (_) { try { return String(obj); } catch (_2) { return '(?)'; } }
-
-        // Java primitives
-        if (cls === 'java.lang.Boolean') return toBool(obj);
-        if (cls === 'java.lang.Integer' || cls === 'java.lang.Short' || cls === 'java.lang.Byte') return unboxInt(obj);
-        if (cls === 'java.lang.Long') {
-            var lv = unboxLong(obj);
-            return (lv > 9007199254740991 || lv < -9007199254740991) ? String(obj) : lv;
-        }
-        if (cls === 'java.lang.Double' || cls === 'java.lang.Float') {
-            try { return parseFloat(String(obj)); } catch (_) { return 0; }
-        }
-        if (cls === 'java.lang.String') return String(obj);
-
-        // byte[]
-        if (cls === '[B') {
-            try {
-                var len = obj.length;
-                var hex = [];
-                for (var bi = 0; bi < Math.min(len, 64); bi++) {
-                    var b = obj[bi] & 0xFF;
-                    hex.push((b < 16 ? '0' : '') + b.toString(16));
-                }
-                return '<bytes[' + len + ']> ' + hex.join(' ') + (len > 64 ? '...' : '');
-            } catch (_) { return '<bytes>'; }
-        }
-
-        // Date
-        if (cls === 'java.util.Date') {
-            try { return Number(invoke0(obj, 'getTime')); } catch (_) { return String(obj); }
-        }
-
-        // Map/BSON (LinkedHashMap, BasicBSONObject 등)
-        if (isMap(obj)) {
-            var mapResult = iterateMap(obj, depth);
-            if (mapResult !== null) return mapResult;
-        }
-
-        // List/Array
-        if (isList(obj)) {
-            var listResult = iterateList(obj, depth);
-            if (listResult !== null) return listResult;
-        }
-
-        // fallback: toString
-        try { return String(obj); } catch (_) { return '(obj)'; }
-    }
-
-    // ==============================================================
-    // extractBody — LocoBody에서 BSON 추출 → JS 변환
-    // ==============================================================
-    function extractBody(body) {
-        if (!body) return null;
-
-        var bodyCls = '';
-        try { bodyCls = body.getClass().getName(); } catch (_) {}
-        emitLog(TAG, 'debug', 'extractBody cls=' + bodyCls);
-
-        // body 자체가 Map이면 바로
-        if (isMap(body)) {
-            var r0 = iterateMap(body, 0);
-            if (r0 !== null) return r0;
-        }
-
-        // LocoBody 내부 필드에서 BSON 찾기
-        try {
-            var bfs = body.getClass().getDeclaredFields();
-            for (var bi = 0; bi < bfs.length; bi++) {
-                if (isStaticField(bfs[bi])) continue;
-                bfs[bi].setAccessible(true);
-                var bv;
-                try { bv = bfs[bi].get(body); } catch (_) { continue; }
-                if (!bv) continue;
-
-                if (isMap(bv)) {
-                    var r = iterateMap(bv, 0);
-                    if (r !== null && Object.keys(r).length > 0) return r;
-                }
-
-                // toMap() fallback
-                var tm = invoke0(bv, 'toMap');
-                if (tm && isMap(tm)) {
-                    var r2 = iterateMap(tm, 0);
-                    if (r2 !== null && Object.keys(r2).length > 0) return r2;
-                }
-            }
-        } catch (e) {
-            emitLog(TAG, 'debug', 'extractBody field err: ' + e.message);
-        }
-
-        // toString fallback
-        try { return String(body); } catch (_) { return null; }
-    }
-
-    // ==============================================================
-    // extractPacket — 패킷에서 header/body 추출
-    //
-    // JADX 분석 결과:
-    //   lq.f (AbstractLocoPacket):
-    //     field a → lq.b (LocoHeader): packetId(int), status(short), method(lq.d enum), bodyLength(int)
-    //     field b → lq.a (LocoBody): field a → Ux0.g (BSONObject, 실제 BasicBSONObject = LinkedHashMap)
-    //   lq.k (LocoReq), lq.l (LocoRes) → extends lq.f
-    //   getter: e() → LocoHeader, c() → LocoBody
-    //   LocoBody getter: a() → BSONObject (Ux0.g)
-    //   BSONObject.toMap() → java.util.Map
-    //   BasicBSONObject (Ux0.k) extends LinkedHashMap → 자체가 Map
-    // ==============================================================
-
-    // AbstractLocoPacket 클래스 캐시
-    var _AbstractLocoPacket = null;
-    try { _AbstractLocoPacket = Java.use('lq.f'); } catch (_) {}
-
-    // getter 메서드 캐시 (reflection)
-    var _pktGetHeader = null, _pktGetBody = null, _bodyGetBson = null;
-    var _pktGettersInited = false;
-
-    function initPacketGetters() {
-        if (_pktGettersInited) return;
-        _pktGettersInited = true;
-
-        // lq.f 필드 직접 접근 (가장 확실한 방법)
-        // field a → lq.b (LocoHeader), field b → lq.a (LocoBody)
-        try {
-            var lqf = Java.use('lq.f').class;
-            var fs = lqf.getDeclaredFields();
-            for (var fi = 0; fi < fs.length; fi++) {
-                if (isStaticField(fs[fi])) continue;
-                fs[fi].setAccessible(true);
-                var ftn = fs[fi].getType().getName();
-                // LocoHeader = lq.b (int, short, enum, int 필드)
-                if (ftn === 'lq.b' && !_pktGetHeader) _pktGetHeader = fs[fi];
-                // LocoBody = lq.a
-                if (ftn === 'lq.a' && !_pktGetBody) _pktGetBody = fs[fi];
-            }
-            emitLog(TAG, 'debug', 'pkt fields: getHeader=' + !!_pktGetHeader + ' getBody=' + !!_pktGetBody);
-        } catch (_) {
-            // lq.f는 빌드마다 이름이 다를 수 있음 — 무시하고 fallback 사용
-        }
-
-        // LocoBody → field a (Ux0.g BSONObject)
-        try {
-            var lqa = Java.use('lq.a').class;
-            var bfs = lqa.getDeclaredFields();
-            for (var bi = 0; bi < bfs.length; bi++) {
-                if (isStaticField(bfs[bi])) continue;
-                bfs[bi].setAccessible(true);
-                _bodyGetBson = bfs[bi]; // 첫 번째 non-static 필드 = bson
-                break;
-            }
-            emitLog(TAG, 'debug', 'bodyGetBson=' + !!_bodyGetBson + (_bodyGetBson ? ' fieldType=' + _bodyGetBson.getType().getName() : ''));
-        } catch (_) {
-            // lq.a도 빌드마다 이름이 다를 수 있음 — 무시하고 fallback 사용
-        }
-    }
-
     function extractPacket(rawPkt) {
         if (!rawPkt) return null;
         try {
-            initPacketGetters();
-
             var header = null, body = null, bsonObj = null;
-            var pktCls = '';
-            try { pktCls = rawPkt.getClass().getName(); } catch (_) {}
 
-            // ======= 방법 1: 필드 직접 접근 (lq.f.a=header, lq.f.b=body) =======
-            if (_pktGetHeader) {
-                try { header = _pktGetHeader.get(rawPkt); } catch (_) {}
+            // Primary: discovered 필드 직접 접근
+            if (_headerField) {
+                try { header = _headerField.get(rawPkt); } catch (_) {}
             }
-            if (_pktGetBody) {
+            if (_bodyField) {
                 try {
-                    var locoBody = _pktGetBody.get(rawPkt);
-                    if (locoBody) {
-                        body = locoBody;
-                        // LocoBody field a → BSONObject
-                        if (_bodyGetBson) {
-                            try { bsonObj = _bodyGetBson.get(locoBody); } catch (_) {}
-                        }
+                    body = _bodyField.get(rawPkt);
+                    if (body && _bsonField) {
+                        try { bsonObj = _bsonField.get(body); } catch (_) {}
                     }
                 } catch (_) {}
             }
 
-            // ======= 방법 2: 필드 탐색 fallback =======
+            // Fallback: 구조 기반 필드 탐색 (discovery 실패 시)
             if (!header || !body) {
                 var cur = rawPkt.getClass();
                 for (var d = 0; d < 6 && cur; d++) {
                     try {
                         var fs = cur.getDeclaredFields();
                         for (var i = 0; i < fs.length; i++) {
-                            if (isStaticField(fs[i])) continue;
+                            if (isStatic(fs[i])) continue;
                             fs[i].setAccessible(true);
-                            var ft = fs[i].getType().getName();
                             var val;
                             try { val = fs[i].get(rawPkt); } catch (_) { continue; }
                             if (!val) continue;
 
-                            // header: int+short 필드를 가진 객체
                             if (!header) {
-                                try {
-                                    var cf = val.getClass().getDeclaredFields();
-                                    var hasInt = false, hasShort = false;
-                                    for (var c = 0; c < cf.length; c++) {
-                                        if (isStaticField(cf[c])) continue;
-                                        var ct = cf[c].getType().getName();
-                                        if (ct === 'int') hasInt = true;
-                                        if (ct === 'short') hasShort = true;
-                                    }
-                                    if (hasInt && hasShort) header = val;
-                                } catch (_) {}
+                                var sig = inspectFieldSignature(val.getClass());
+                                if (sig.intCount >= 2 && sig.shortCount >= 1 && sig.enumCount >= 1) {
+                                    header = val;
+                                    continue;
+                                }
                             }
-
-                            // body: Map이거나 내부에 Map이 있는 객체
                             if (!body) {
                                 if (isMap(val)) { bsonObj = val; body = val; }
                                 else {
                                     try {
                                         var bf = val.getClass().getDeclaredFields();
                                         for (var bi = 0; bi < bf.length; bi++) {
-                                            if (isStaticField(bf[bi])) continue;
+                                            if (isStatic(bf[bi])) continue;
                                             bf[bi].setAccessible(true);
                                             var bfv;
                                             try { bfv = bf[bi].get(val); } catch (_) { continue; }
@@ -471,23 +434,25 @@ function installLocoMonitor() {
                 }
             }
 
-            // ======= header 파싱 =======
+            // 헤더 파싱
             var pid = -1, st = -1, meth = '?', blen = -1;
             if (header) {
                 try {
                     var hfs = header.getClass().getDeclaredFields();
                     var ints = [];
                     for (var hi = 0; hi < hfs.length; hi++) {
-                        if (isStaticField(hfs[hi])) continue;
+                        if (isStatic(hfs[hi])) continue;
                         hfs[hi].setAccessible(true);
-                        var hft = hfs[hi].getType().getName();
+                        var hft = hfs[hi].getType();
+                        var hftn = hft.getName();
                         var hv;
                         try { hv = hfs[hi].get(header); } catch (_) { continue; }
-                        if (hft === 'int') { ints.push(unboxInt(hv)); }
-                        else if (hft === 'short') { st = unboxInt(hv); }
+                        if (hftn === 'int') ints.push(unboxInt(hv));
+                        else if (hftn === 'short') st = unboxInt(hv);
                         else {
-                            var isPrim = 'int,short,boolean,long,byte,float,double,char'.indexOf(hft) >= 0;
-                            if (!isPrim && hft.indexOf('java.') !== 0 && hft.indexOf('kotlin.') !== 0 && hv) {
+                            var isEnumType = false;
+                            try { isEnumType = hft.isEnum(); } catch (_) {}
+                            if (isEnumType && hv) {
                                 var en = enumName(hv);
                                 if (en) meth = en;
                             }
@@ -498,63 +463,40 @@ function installLocoMonitor() {
                 } catch (_) {}
             }
 
-            // ======= body → BSON → JS =======
-            if (shouldLog(TAG, 'debug')) {
-                var hdrCls = '';
-                try { hdrCls = header ? header.getClass().getName() : 'null'; } catch (_) {}
-                var bdyCls = '';
-                try { bdyCls = body ? body.getClass().getName() : 'null'; } catch (_) {}
-                var bsonCls = '';
-                try { bsonCls = bsonObj ? bsonObj.getClass().getName() : 'null'; } catch (_) {}
-                emitLog(TAG, 'debug', 'extractPacket pkt=' + pktCls + ' hdr=' + hdrCls + ' body=' + bdyCls + ' bson=' + bsonCls + ' isMap=' + isMap(bsonObj));
-            }
-
+            // 바디 → BSON → JS
             var bodyObj = null;
-            // bsonObj가 이미 추출된 경우 → 직접 변환
-            if (bsonObj) {
-                if (isMap(bsonObj)) {
-                    bodyObj = iterateMap(bsonObj, 0);
-                }
-                if (!bodyObj) {
-                    // toMap() fallback
-                    var tm = invoke0(bsonObj, 'toMap');
-                    if (tm && isMap(tm)) bodyObj = iterateMap(tm, 0);
-                }
-                if (!bodyObj) {
-                    try { bodyObj = String(bsonObj); } catch (_) {}
-                }
+            if (bsonObj && isMap(bsonObj)) {
+                bodyObj = iterateMap(bsonObj, 0);
             } else if (body) {
-                bodyObj = extractBody(body);
+                if (isMap(body)) {
+                    bodyObj = iterateMap(body, 0);
+                } else {
+                    // body에서 Map 필드 재탐색
+                    try {
+                        var bfs = body.getClass().getDeclaredFields();
+                        for (var bi = 0; bi < bfs.length; bi++) {
+                            if (isStatic(bfs[bi])) continue;
+                            bfs[bi].setAccessible(true);
+                            var bv;
+                            try { bv = bfs[bi].get(body); } catch (_) { continue; }
+                            if (bv && isMap(bv)) {
+                                bodyObj = iterateMap(bv, 0);
+                                if (bodyObj !== null) break;
+                            }
+                        }
+                    } catch (_) {}
+                }
             }
 
             return { header: { packetId: pid, status: st, method: meth, bodyLength: blen }, body: bodyObj };
         } catch (e) {
             emitLog(TAG, 'warn', 'extractPacket err: ' + e.message);
-            return { header: {}, body: null, error: e.message };
+            return { header: {}, body: null };
         }
     }
 
     // ==============================================================
-    // 런타임 메서드 파라미터 타입
-    // ==============================================================
-    function getParamTypes(cls, name) {
-        var results = [];
-        try {
-            var ms = cls.getDeclaredMethods();
-            for (var i = 0; i < ms.length; i++) {
-                if (ms[i].getName() === name) {
-                    var ps = ms[i].getParameterTypes();
-                    var r = [];
-                    for (var j = 0; j < ps.length; j++) r.push(ps[j].getName());
-                    results.push(r);
-                }
-            }
-        } catch (_) {}
-        return results;
-    }
-
-    // ==============================================================
-    // send/recv 공통 처리
+    // 패킷 emit
     // ==============================================================
     function emitPacket(event, job, pkt) {
         var methodName = '?';
@@ -564,10 +506,9 @@ function installLocoMonitor() {
         try { pktInfo = extractPacket(pkt); } catch (_) {}
         var hdr = pktInfo ? pktInfo.header : {};
 
-        // header의 method가 더 정확할 수 있음
         if (methodName === '?' && hdr.method && hdr.method !== '?') methodName = hdr.method;
 
-        // 노이즈 스킵 (method도 없고 body도 없음)
+        // 메서드도 바디도 없으면 노이즈
         if (methodName === '?' && (!pktInfo || !pktInfo.body)) return;
 
         send({
@@ -581,175 +522,79 @@ function installLocoMonitor() {
     }
 
     // ==============================================================
-    // 1. LocoJob.f(request, continuation) → 송신 hook
+    // Hook: LocoJob.f(req, cont) → 송신
     // ==============================================================
     var fHooked = false;
-    var fOverloads = getParamTypes(LocoJobClass.class, 'f');
-    emitLog(TAG, 'debug', 'f() overloads: ' + fOverloads.length);
-
-    for (var fo = 0; fo < fOverloads.length; fo++) {
-        var fpt = fOverloads[fo];
-        if (fpt.length === 2) {
-            emitLog(TAG, 'debug', 'f() params: ' + fpt.join(','));
-            try {
-                var fOverload = LocoJobClass.f.overload(fpt[0], fpt[1]);
-                fOverload.implementation = function (req, cont) {
+    if (fOverloadParams) {
+        try {
+            var fOverload = LocoJobClass.f.overload(fOverloadParams[0], fOverloadParams[1]);
+            fOverload.implementation = function (req, cont) {
+                try {
+                    var isResume = false;
                     try {
-                        var isResume = false;
-                        try {
-                            if (cont && cont.getClass) {
-                                var cc = cont.getClass().getName();
-                                isResume = cc.indexOf('LocoJob') >= 0 && cc.indexOf('$') >= 0;
-                            }
-                        } catch (_) {}
-
-                        if (!isResume) {
-                            emitPacket('send', this, req);
-                        }
-                    } catch (e) {
-                        emitLog(TAG, 'warn', 'send err: ' + e.message);
-                    }
-
-                    var ret = fOverload.call(this, req, cont);
-
-                    // resume 후 return 값 캡처
-                    try {
-                        if (ret != null) {
-                            var retCls = '';
-                            try { retCls = ret.getClass().getName(); } catch (_) {}
-                            // COROUTINE_SUSPENDED marker (iv0.a)나 kotlin 타입은 스킵
-                            if (retCls && retCls !== 'iv0.a' && retCls.indexOf('kotlin.') < 0) {
-                                var testPkt = extractPacket(ret);
-                                if (testPkt && testPkt.header && testPkt.header.packetId > 0) {
-                                    emitPacket('recv', this, ret);
-                                }
-                            }
+                        if (cont && cont.getClass) {
+                            var cc = cont.getClass().getName();
+                            isResume = cc.indexOf('LocoJob') >= 0 && cc.indexOf('$') >= 0;
                         }
                     } catch (_) {}
-
-                    return ret;
-                };
-                hookCount++;
-                fHooked = true;
-                emitLog(TAG, 'info', 'LocoJob.f(' + fpt.join(',') + ') 후킹 성공');
-                break;
-            } catch (e) {
-                emitLog(TAG, 'warn', 'LocoJob.f 후킹 실패: ' + e.message);
-            }
+                    if (!isResume) emitPacket('send', this, req);
+                } catch (e) {
+                    emitLog(TAG, 'warn', 'send err: ' + e.message);
+                }
+                return fOverload.call(this, req, cont);
+            };
+            hookCount++;
+            fHooked = true;
+            emitLog(TAG, 'info', 'LocoJob.f 송신 후킹 성공');
+        } catch (e) {
+            emitLog(TAG, 'warn', 'LocoJob.f 후킹 실패: ' + e.message);
         }
     }
 
-    if (!fHooked) {
-        emitLog(TAG, 'warn', 'LocoJob.f 후킹 불가');
-    }
-
     // ==============================================================
-    // 2. LocoJob.v(response) → 수신 hook (status 검증)
-    //    a()에서 f() 결과로 response를 받은 뒤 호출됨
-    //    public final void v(lq.l)
+    // Hook: LocoJob.v(res) → 수신 (primary)
     // ==============================================================
     var vHooked = false;
-    try {
-        var vOverload = LocoJobClass.v.overload('lq.l');
-        vOverload.implementation = function (resp) {
-            try {
-                emitPacket('recv', this, resp);
-            } catch (e) {
-                emitLog(TAG, 'warn', 'recv/v err: ' + e.message);
-            }
-            return vOverload.call(this, resp);
-        };
-        hookCount++;
-        vHooked = true;
-        emitLog(TAG, 'info', 'LocoJob.v(lq.l) 수신 후킹 성공');
-    } catch (e) {
-        emitLog(TAG, 'debug', 'v(lq.l) 직접 overload 실패: ' + e.message);
-        // fallback: 리플렉션으로 파라미터 타입 찾기
+    if (vOverloadParam) {
         try {
-            var vMs = LocoJobClass.class.getDeclaredMethods();
-            for (var vi = 0; vi < vMs.length; vi++) {
-                if (vMs[vi].getName() === 'v') {
-                    var vp = vMs[vi].getParameterTypes();
-                    if (vp.length === 1) {
-                        var vpn = vp[0].getName();
-                        if (vpn !== 'long' && vpn !== 'int' && vpn !== 'boolean' &&
-                            vpn.indexOf('java.') !== 0 && vpn.indexOf('kotlin.') !== 0) {
-                            emitLog(TAG, 'debug', 'v() fallback param=' + vpn);
-                            var vOverload2 = LocoJobClass.v.overload(vpn);
-                            vOverload2.implementation = function (resp) {
-                                try { emitPacket('recv', this, resp); } catch (e2) { emitLog(TAG, 'warn', 'recv/v: ' + e2.message); }
-                                return vOverload2.call(this, resp);
-                            };
-                            hookCount++;
-                            vHooked = true;
-                            emitLog(TAG, 'info', 'LocoJob.v(' + vpn + ') 수신 후킹 성공 (fallback)');
-                            break;
-                        }
-                    }
-                }
-            }
-        } catch (e2) {
-            emitLog(TAG, 'warn', 'LocoJob.v 후킹 실패: ' + e2.message);
+            var vOverload = LocoJobClass.v.overload(vOverloadParam);
+            vOverload.implementation = function (resp) {
+                try { emitPacket('recv', this, resp); }
+                catch (e) { emitLog(TAG, 'warn', 'recv err: ' + e.message); }
+                return vOverload.call(this, resp);
+            };
+            hookCount++;
+            vHooked = true;
+            emitLog(TAG, 'info', 'LocoJob.v 수신 후킹 성공');
+        } catch (e) {
+            emitLog(TAG, 'warn', 'LocoJob.v 후킹 실패: ' + e.message);
         }
     }
 
     // ==============================================================
-    // 3. LocoJob.n(response, hookFn) → 수신 hook (hook 적용)
-    //    a()에서 v()보다 먼저 호출됨
-    //    public final lq.l n(lq.l, Function1)
+    // Hook: LocoJob.n(res, Function1) → 수신 (v 실패 시 fallback)
     // ==============================================================
-    var nHooked = false;
-    try {
-        var nOverload = LocoJobClass.n.overload('lq.l', 'kotlin.jvm.functions.Function1');
-        nOverload.implementation = function (resp, hookFn) {
-            try {
-                // v()에서도 로깅하므로 n()은 debug 레벨로만 중복 방지
-                // (v가 안 잡히면 n이 primary)
-                if (!vHooked) {
-                    emitPacket('recv', this, resp);
-                }
-            } catch (e) {
-                emitLog(TAG, 'warn', 'recv/n err: ' + e.message);
-            }
-            return nOverload.call(this, resp, hookFn);
-        };
-        hookCount++;
-        nHooked = true;
-        emitLog(TAG, 'info', 'LocoJob.n(lq.l, Function1) 수신 후킹 성공');
-    } catch (e) {
-        emitLog(TAG, 'debug', 'n(lq.l, Function1) 직접 overload 실패: ' + e.message);
-        // fallback: 리플렉션으로 파라미터 타입 찾기
+    if (!vHooked && nOverloadParams) {
         try {
-            var nMs = LocoJobClass.class.getDeclaredMethods();
-            for (var ni = 0; ni < nMs.length; ni++) {
-                if (nMs[ni].getName() === 'n') {
-                    var nps = nMs[ni].getParameterTypes();
-                    if (nps.length === 2) {
-                        var np0 = nps[0].getName(), np1 = nps[1].getName();
-                        emitLog(TAG, 'debug', 'n() fallback params=' + np0 + ',' + np1);
-                        var nOverload2 = LocoJobClass.n.overload(np0, np1);
-                        nOverload2.implementation = function (resp, hookFn) {
-                            try { if (!vHooked) emitPacket('recv', this, resp); } catch (e2) { emitLog(TAG, 'warn', 'recv/n: ' + e2.message); }
-                            return nOverload2.call(this, resp, hookFn);
-                        };
-                        hookCount++;
-                        nHooked = true;
-                        emitLog(TAG, 'info', 'LocoJob.n(' + np0 + ',' + np1 + ') 수신 후킹 성공 (fallback)');
-                        break;
-                    }
-                }
-            }
-        } catch (e2) {
-            emitLog(TAG, 'warn', 'LocoJob.n 후킹 실패: ' + e2.message);
+            var nOverload = LocoJobClass.n.overload(nOverloadParams[0], nOverloadParams[1]);
+            nOverload.implementation = function (resp, hookFn) {
+                try { emitPacket('recv', this, resp); }
+                catch (e) { emitLog(TAG, 'warn', 'recv/n err: ' + e.message); }
+                return nOverload.call(this, resp, hookFn);
+            };
+            hookCount++;
+            emitLog(TAG, 'info', 'LocoJob.n 수신 후킹 성공 (fallback)');
+        } catch (e) {
+            emitLog(TAG, 'warn', 'LocoJob.n 후킹 실패: ' + e.message);
         }
     }
 
-    if (!vHooked && !nHooked) {
-        emitLog(TAG, 'warn', 'response 후킹 불가 — PUSH 모니터링으로 fallback');
+    if (!fHooked && !vHooked) {
+        emitLog(TAG, 'warn', '송/수신 후킹 모두 실패');
     }
 
     // ==============================================================
-    // 4. Socket.connect → LOCO 소켓
+    // Hook: Socket.connect → LOCO 서버 연결 감지
     // ==============================================================
     try {
         var Socket = Java.use('java.net.Socket');
@@ -767,7 +612,7 @@ function installLocoMonitor() {
 
     if (hookCount > 0) {
         _locoInstalled = true;
-        emitLog(TAG, 'info', 'LOCO 모니터 설치 완료 (' + hookCount + '개 후킹)');
+        emitLog(TAG, 'info', 'LOCO 모니터 설치 완료 (' + hookCount + '개 훅)');
     } else {
         emitLog(TAG, 'error', 'LOCO 모니터: 후킹 없음');
     }
