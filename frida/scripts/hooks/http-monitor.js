@@ -412,21 +412,64 @@ function _hookOkHttpChain() {
                 }
             } catch (_) { isFirst = true; }
 
-            if (isFirst) _logReq(req);
             var resp;
             try {
                 resp = this.proceed(req);
             } catch (e) {
-                if (isFirst) emitLog('http-monitor', 'warn', 'proceed 예외: ' + e.message);
+                if (isFirst) {
+                    // 앱 코드/SDK가 던진 예외 — 우리 훅 실패 아님
+                    _logReqFailed(req, e);
+                }
                 throw e;
             }
-            if (isFirst) _logResp(req, resp);
+            if (isFirst) {
+                // resp.request()는 모든 interceptor가 추가한 최종 헤더를 포함
+                var finalReq = req;
+                try { finalReq = resp.request(); } catch (_) {}
+                _logReq(finalReq);
+                _logResp(finalReq, resp);
+            }
             return resp;
         };
-        emitLog('http-monitor', 'info', 'RealInterceptorChain.proceed 후킹 성공 (indexField=' + indexFieldName + ')');
+        emitLog('http-monitor', 'info', 'OkHttp chain 후킹 성공');
     } catch (e) {
-        emitLog('http-monitor', 'warn', 'RealInterceptorChain.proceed 후킹 실패: ' + e.message);
+        emitLog('http-monitor', 'warn', 'OkHttp chain 후킹 실패: ' + e.message);
     }
+}
+
+// ── body 정리: 파싱 가능하면 JS 객체로, 아니면 안전 cap 적용 ─
+// (JSON 경계를 무시하고 byte-단위로 자르면 pretty-print가 깨지므로
+//  파싱 가능할 땐 객체째 보낸다)
+var _BODY_MAX_STR = 16384;
+function _normalizeBody(body) {
+    if (body == null) return null;
+    if (typeof body !== 'string') return body;
+    var trimmed;
+    try { trimmed = body.trim(); } catch (_) { trimmed = ''; }
+    if (trimmed && (trimmed[0] === '{' || trimmed[0] === '[')) {
+        try { return JSON.parse(trimmed); } catch (_) {}
+    }
+    if (body.length > _BODY_MAX_STR) {
+        return body.substring(0, _BODY_MAX_STR) + '…(truncated)';
+    }
+    return body;
+}
+
+// ── 예외 발생 시 요청만 로깅 ───────────────────────────────
+function _logReqFailed(req, err) {
+    try {
+        var url = req.url().toString();
+        var method = req.method();
+        var headers = null;
+        try { headers = _extractHeaders(req.headers()); } catch (_) {}
+        var errMsg = 'unknown error';
+        try { errMsg = (err && err.message) ? err.message : String(err); } catch (_) {}
+        send({
+            type: 'http', event: 'failed',
+            method: method, url: url, headers: headers,
+            error: errMsg,
+        });
+    } catch (_) {}
 }
 
 // ── 요청 로깅 ───────────────────────────────────────────
@@ -435,13 +478,10 @@ function _logReq(req) {
     try {
         var url = req.url().toString();
         var method = req.method();
-        var isDebug = shouldLog('http-monitor', 'debug');
 
         var headers = null;
-        if (isDebug) {
-            try { headers = _extractHeaders(req.headers()); }
-            catch (e) { emitLog('http-monitor', 'debug', 'req headers 실패: ' + e.message); }
-        }
+        try { headers = _extractHeaders(req.headers()); }
+        catch (e) { emitLog('http-monitor', 'debug', 'req headers 실패: ' + e.message); }
 
         var body = null;
         var rb = req.body();
@@ -462,10 +502,9 @@ function _logReq(req) {
             } catch (e) {
                 emitLog('http-monitor', 'debug', 'req body 실패: ' + e.message);
             }
-            if (body && body.length > 1024) body = body.substring(0, 1024) + '...';
         }
 
-        send({ type: 'http', event: 'request', method: method, url: url, headers: headers, body: body });
+        send({ type: 'http', event: 'request', method: method, url: url, headers: headers, body: _normalizeBody(body) });
     } catch (e) {
         emitLog('http-monitor', 'debug', '_logReq 실패: ' + e.message);
     }
@@ -477,13 +516,10 @@ function _logResp(req, resp) {
     try {
         var url = req.url().toString();
         var code = resp.code();
-        var isDebug = shouldLog('http-monitor', 'debug');
 
         var headers = null;
-        if (isDebug) {
-            try { headers = _extractHeaders(resp.headers()); }
-            catch (e) { emitLog('http-monitor', 'debug', 'resp headers 실패: ' + e.message); }
-        }
+        try { headers = _extractHeaders(resp.headers()); }
+        catch (e) { emitLog('http-monitor', 'debug', 'resp headers 실패: ' + e.message); }
 
         var body = null;
         try {
@@ -514,8 +550,7 @@ function _logResp(req, resp) {
             emitLog('http-monitor', 'debug', 'resp body 실패: ' + e.message);
         }
 
-        if (body && body.length > 2048) body = body.substring(0, 2048) + '...';
-        send({ type: 'http', event: 'response', code: code, url: url, headers: headers, body: body });
+        send({ type: 'http', event: 'response', code: code, url: url, headers: headers, body: _normalizeBody(body) });
     } catch (e) {
         emitLog('http-monitor', 'debug', '_logResp 실패: ' + e.message);
     }
