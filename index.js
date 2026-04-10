@@ -91,7 +91,7 @@ async function main() {
       message: '작업을 선택하세요:',
       choices: [
         { name: '1. 디바이스 목록 보기', value: 'devices' },
-        { name: '2. APK/XAPK 설치', value: 'apk' },
+        { name: '2. APK/XAPK/Split APK 설치', value: 'apk' },
         { name: '3. frida-server 설치 및 실행', value: 'install' },
         { name: '4. Hook - Spawn (권장)', value: 'spawn' },
         { name: '5. Hook - Attach', value: 'attach' },

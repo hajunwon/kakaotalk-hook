@@ -1,10 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createReadStream, mkdirSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
-import { resolve, extname } from 'node:path';
-import { createWriteStream } from 'node:fs';
-import { pipeline } from 'node:stream/promises';
-import { createUnzip } from 'node:zlib';
+import { mkdirSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { resolve, extname, basename } from 'node:path';
 import { getAdbPath, CACHE_DIR } from '../config.js';
 import inquirer from 'inquirer';
 
@@ -15,7 +12,6 @@ async function extractZip(zipPath, destDir) {
   if (existsSync(destDir)) rmSync(destDir, { recursive: true });
   mkdirSync(destDir, { recursive: true });
 
-  // .NET ZipFile.ExtractToDirectory는 확장자 상관없이 ZIP 포맷이면 해제 가능
   await execFileAsync('powershell', [
     '-NoProfile', '-Command',
     `Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPath}', '${destDir}')`,
@@ -30,7 +26,6 @@ function findApkFiles(dir) {
     if (stat.isFile() && extname(entry).toLowerCase() === '.apk') {
       files.push(full);
     }
-    // xapk는 보통 flat 구조이지만 혹시 하위 디렉토리가 있을 수 있음
     if (stat.isDirectory()) {
       files.push(...findApkFiles(full));
     }
@@ -38,8 +33,42 @@ function findApkFiles(dir) {
   return files;
 }
 
-export async function installXapk(serial, xapkPath) {
+// base.apk를 맨 앞으로 정렬 (adb install-multiple이 요구하지는 않지만 관례)
+function sortApkFiles(files) {
+  return [...files].sort((a, b) => {
+    const aBase = basename(a).toLowerCase() === 'base.apk' ? 0 : 1;
+    const bBase = basename(b).toLowerCase() === 'base.apk' ? 0 : 1;
+    if (aBase !== bBase) return aBase - bBase;
+    return basename(a).localeCompare(basename(b));
+  });
+}
+
+async function installApkFiles(serial, apkFiles) {
   const adb = getAdbPath();
+  const sorted = sortApkFiles(apkFiles);
+
+  console.log(`  APK 파일 ${sorted.length}개:`);
+  for (const f of sorted) {
+    const size = (statSync(f).size / (1024 * 1024)).toFixed(1);
+    console.log(`    - ${basename(f)} (${size} MB)`);
+  }
+
+  if (sorted.length === 1) {
+    console.log(`\n  단일 APK 설치 중...`);
+    const { stdout } = await execFileAsync(adb, [
+      '-s', serial, 'install', '-r', sorted[0],
+    ], { timeout: 300000 });
+    console.log(`  ${stdout.trim()}`);
+  } else {
+    console.log(`\n  Split APK 설치 중 (install-multiple)...`);
+    const { stdout } = await execFileAsync(adb, [
+      '-s', serial, 'install-multiple', '-r', ...sorted,
+    ], { timeout: 300000 });
+    console.log(`  ${stdout.trim()}`);
+  }
+}
+
+export async function installXapk(serial, xapkPath) {
   const extractDir = resolve(CACHE_DIR, 'xapk-extract');
 
   console.log(`\n  xapk 압축 해제 중: ${xapkPath}`);
@@ -50,61 +79,61 @@ export async function installXapk(serial, xapkPath) {
     throw new Error('xapk 안에 APK 파일을 찾을 수 없습니다.');
   }
 
-  console.log(`  APK 파일 ${apkFiles.length}개 발견:`);
-  for (const f of apkFiles) {
-    const size = (statSync(f).size / (1024 * 1024)).toFixed(1);
-    console.log(`    - ${f.split(/[\\/]/).pop()} (${size} MB)`);
+  try {
+    await installApkFiles(serial, apkFiles);
+  } finally {
+    rmSync(extractDir, { recursive: true, force: true });
   }
+  console.log(`  설치 완료!\n`);
+}
 
-  // 전체 APK 크기 합산 (install-multiple -S 옵션용)
-  const totalSize = apkFiles.reduce((sum, f) => sum + statSync(f).size, 0);
-
-  if (apkFiles.length === 1) {
-    // 단일 APK
-    console.log(`\n  단일 APK 설치 중...`);
-    const { stdout } = await execFileAsync(adb, [
-      '-s', serial, 'install', '-r', apkFiles[0],
-    ], { timeout: 300000 });
-    console.log(`  ${stdout.trim()}`);
-  } else {
-    // Split APK → adb install-multiple
-    console.log(`\n  Split APK 설치 중 (install-multiple)...`);
-    const args = ['-s', serial, 'install-multiple', '-r', ...apkFiles];
-    const { stdout } = await execFileAsync(adb, args, { timeout: 300000 });
-    console.log(`  ${stdout.trim()}`);
+export async function installSplitDir(serial, dirPath) {
+  console.log(`\n  디렉토리에서 split APK 검색 중: ${dirPath}`);
+  const apkFiles = findApkFiles(dirPath);
+  if (apkFiles.length === 0) {
+    throw new Error('디렉토리 안에 APK 파일이 없습니다.');
   }
+  await installApkFiles(serial, apkFiles);
+  console.log(`  설치 완료!\n`);
+}
 
-  // 정리
-  rmSync(extractDir, { recursive: true, force: true });
+export async function installApkFile(serial, apkPath) {
+  await installApkFiles(serial, [apkPath]);
   console.log(`  설치 완료!\n`);
 }
 
 export async function promptAndInstall(serial) {
-  const { xapkPath } = await inquirer.prompt([{
+  const { targetPath } = await inquirer.prompt([{
     type: 'input',
-    name: 'xapkPath',
-    message: 'xapk 파일 경로를 입력하세요:',
+    name: 'targetPath',
+    message: 'APK 경로 입력 (.apk/.xapk/.apks 파일 또는 split APK 디렉토리):',
     validate: (v) => {
-      if (!existsSync(v)) return '파일을 찾을 수 없습니다.';
+      if (!existsSync(v)) return '경로를 찾을 수 없습니다.';
+      const stat = statSync(v);
+      if (stat.isDirectory()) {
+        const apks = findApkFiles(v);
+        if (apks.length === 0) return '디렉토리 안에 .apk 파일이 없습니다.';
+        return true;
+      }
       const ext = extname(v).toLowerCase();
       if (ext !== '.xapk' && ext !== '.apk' && ext !== '.apks') {
-        return '.xapk, .apk, .apks 파일만 지원합니다.';
+        return '.xapk, .apk, .apks 파일 또는 디렉토리를 지정하세요.';
       }
       return true;
     },
   }]);
 
-  const ext = extname(xapkPath).toLowerCase();
+  const stat = statSync(targetPath);
+  if (stat.isDirectory()) {
+    await installSplitDir(serial, targetPath);
+    return;
+  }
 
+  const ext = extname(targetPath).toLowerCase();
   if (ext === '.apk') {
-    // 일반 APK 직접 설치
     console.log(`\n  APK 설치 중...`);
-    const { stdout } = await execFileAsync(getAdbPath(), [
-      '-s', serial, 'install', '-r', xapkPath,
-    ], { timeout: 300000 });
-    console.log(`  ${stdout.trim()}\n`);
+    await installApkFile(serial, targetPath);
   } else {
-    // xapk / apks → ZIP 해제 후 split install
-    await installXapk(serial, xapkPath);
+    await installXapk(serial, targetPath);
   }
 }

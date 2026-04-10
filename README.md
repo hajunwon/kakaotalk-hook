@@ -8,7 +8,7 @@ Frida hooking toolkit and TypeScript client library for KakaoTalk, based on reve
 
 - **Frida Hooking** — Monitor HTTP/LOCO traffic, bypass anti-detection, spoof device properties
 - **LOCO Protocol Client** — TypeScript implementation of KakaoTalk's LOCO protocol (auth, messaging, session management)
-- **ADB Device Management** — Automated device connection, frida-server deployment, APK/XAPK installation
+- **ADB Device Management** — Automated device connection, frida-server deployment, APK/XAPK/split APK installation
 
 ## Project Structure
 
@@ -19,7 +19,7 @@ Frida hooking toolkit and TypeScript client library for KakaoTalk, based on reve
 ├── adb/                    # ADB device management
 │   ├── device-manager.js   # Device listing / selection / shell
 │   ├── frida-server.js     # frida-server download & deployment
-│   └── xapk-installer.js   # XAPK/APK installation
+│   └── xapk-installer.js   # XAPK/APK/split APK installation
 ├── frida/                  # Frida scripts
 │   ├── script-manager.js   # Script loading & session management
 │   └── scripts/
@@ -76,7 +76,7 @@ npm start
 
 The interactive menu provides the following options:
 1. List connected devices
-2. Install APK/XAPK
+2. Install APK / XAPK / split APK (single `.apk`, `.xapk`/`.apks` bundle, or a directory containing `base.apk` + `split_config.*.apk`)
 3. Deploy frida-server
 4. Start hooking (spawn/attach)
 5. Stop frida-server
