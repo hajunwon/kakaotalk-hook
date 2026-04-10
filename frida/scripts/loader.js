@@ -20,7 +20,7 @@ function _findAppCL() {
                     loader.loadClass('com.kakao.talk.application.App');
                     Java.classFactory.loader = loader;
                     _clFound = true;
-                    emitLog('kakaotalk-app', 'info', '[+] 앱 ClassLoader 발견');
+                    emitLog('loader', 'info', '앱 ClassLoader 발견');
 
                     // 앱 classloader 필요한 hook
                     if (isScriptEnabled('nfilter')) {
@@ -50,7 +50,7 @@ function _waitJava() {
     if (!Java.available) { setTimeout(_waitJava, 100); return; }
 
     Java.perform(() => {
-        emitLog('anti-kill', 'info', '[+] Java VM ready');
+        emitLog('loader', 'info', 'Java VM ready');
 
         // 기본 classloader hook
         if (isScriptEnabled('anti-kill')) {

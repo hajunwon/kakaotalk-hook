@@ -6,6 +6,263 @@ import { TARGET_PKG, getDeviceSpoof, getFridaHooks } from '../config.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// ============================================================
+// Pretty printer — HTTP / LOCO 블록 출력
+// ============================================================
+
+const C = {
+    reset: '\x1b[0m',
+    dim:   '\x1b[2m',
+    bold:  '\x1b[1m',
+    red:   '\x1b[31m',
+    green: '\x1b[32m',
+    yel:   '\x1b[33m',
+    blue:  '\x1b[34m',
+    mag:   '\x1b[35m',
+    cyan:  '\x1b[36m',
+    white: '\x1b[37m',
+};
+
+// 박스 출력: ┌ 제목 │ 본문... └ 닫기
+// contentLines가 비어있으면 단일 라인(─ 제목)으로 축약
+function printBox(barColor, titleLine, contentLines) {
+    if (!contentLines || contentLines.length === 0) {
+        console.log(`  ${barColor}─${C.reset} ${titleLine}`);
+        return;
+    }
+    console.log(`  ${barColor}┌${C.reset} ${titleLine}`);
+    for (const line of contentLines) {
+        if (line === '') {
+            console.log(`  ${barColor}│${C.reset}`);
+        } else {
+            console.log(`  ${barColor}│${C.reset} ${line}`);
+        }
+    }
+    console.log(`  ${barColor}└${C.reset}`);
+}
+
+// 단일 라인 이벤트: ▸ [scope] 내용
+function printEvent(scopeColor, scope, detail) {
+    console.log(`  ${C.dim}▸${C.reset} ${scopeColor}${scope}${C.reset} ${C.dim}${detail}${C.reset}`);
+}
+
+// JSON 값 색상
+function colorVal(v) {
+    if (v === null || v === undefined) return `${C.dim}null${C.reset}`;
+    if (typeof v === 'boolean') return `${C.yel}${v}${C.reset}`;
+    if (typeof v === 'number') {
+        if (Math.abs(v) > 9999999999) return `${C.mag}${v}${C.reset}`;
+        return `${C.cyan}${v}${C.reset}`;
+    }
+    if (typeof v === 'string') return `${C.green}"${v}"${C.reset}`;
+    return String(v);
+}
+
+// 객체/배열을 컬러 JSON 문자열 배열로 (각 원소 = 한 줄)
+function formatJsonLines(value, indent) {
+    indent = indent || 0;
+    const pad = '  '.repeat(indent);
+    const padIn = '  '.repeat(indent + 1);
+
+    if (value === null || typeof value !== 'object') {
+        return [colorVal(value)];
+    }
+
+    // 재귀 호출 결과 병합 헬퍼
+    //   inner[0]: 여는 괄호 한 글자만 있음 (padding 없음) → padIn + prefix + inner[0]
+    //   inner[1..n-2]: 이미 절대 indent 포함 → 그대로
+    //   inner[n-1]: 닫는 괄호 (이미 pad 포함) → 그대로 + tail
+    function appendInner(lines, inner, prefix, tail) {
+        if (inner.length === 1) {
+            lines.push(padIn + prefix + inner[0] + tail);
+            return;
+        }
+        lines.push(padIn + prefix + inner[0]);
+        for (let j = 1; j < inner.length - 1; j++) lines.push(inner[j]);
+        lines.push(inner[inner.length - 1] + tail);
+    }
+
+    if (Array.isArray(value)) {
+        if (value.length === 0) return ['[]'];
+        const primitives = value.every(v => v === null || typeof v !== 'object');
+        if (primitives && value.length <= 6) {
+            return ['[' + value.map(colorVal).join(', ') + ']'];
+        }
+        const lines = ['['];
+        value.forEach((v, i) => {
+            const inner = formatJsonLines(v, indent + 1);
+            const tail = i < value.length - 1 ? ',' : '';
+            appendInner(lines, inner, '', tail);
+        });
+        lines.push(pad + ']');
+        return lines;
+    }
+
+    const keys = Object.keys(value);
+    if (keys.length === 0) return ['{}'];
+
+    // 값이 짧고 개수 적으면 한 줄로
+    const compactable = keys.length <= 4 && keys.every(k => {
+        const v = value[k];
+        return v === null || typeof v !== 'object';
+    });
+    if (compactable) {
+        const pairs = keys.map(k => `${C.white}${k}${C.reset}: ${colorVal(value[k])}`);
+        const one = '{ ' + pairs.join(', ') + ' }';
+        if (one.length < 120) return [one];
+    }
+
+    const lines = ['{'];
+    keys.forEach((k, i) => {
+        const inner = formatJsonLines(value[k], indent + 1);
+        const tail = i < keys.length - 1 ? ',' : '';
+        appendInner(lines, inner, `${C.white}${k}${C.reset}: `, tail);
+    });
+    lines.push(pad + '}');
+    return lines;
+}
+
+// body를 블록 라인들로 변환 (문자열이면 JSON 시도, 너무 길면 축약)
+const BODY_MAX_DISPLAY_LINES = 60;
+const BODY_MAX_LINE_WIDTH = 500;
+
+function wrapLongLine(line) {
+    if (line.length <= BODY_MAX_LINE_WIDTH) return [line];
+    const chunks = [];
+    for (let i = 0; i < line.length; i += BODY_MAX_LINE_WIDTH) {
+        chunks.push(line.substring(i, i + BODY_MAX_LINE_WIDTH));
+    }
+    return chunks;
+}
+
+function bodyToLines(body) {
+    if (body === null || body === undefined) return [];
+    let lines;
+    if (typeof body === 'string') {
+        const trimmed = body.trim();
+        if (trimmed && (trimmed[0] === '{' || trimmed[0] === '[')) {
+            try {
+                lines = formatJsonLines(JSON.parse(trimmed), 0);
+            } catch (_) {
+                lines = body.split('\n').flatMap(wrapLongLine);
+            }
+        } else {
+            lines = body.split('\n').flatMap(wrapLongLine);
+        }
+    } else {
+        lines = formatJsonLines(body, 0);
+    }
+
+    if (lines.length > BODY_MAX_DISPLAY_LINES) {
+        const extra = lines.length - BODY_MAX_DISPLAY_LINES;
+        return lines.slice(0, BODY_MAX_DISPLAY_LINES).concat([
+            `${C.dim}… (+${extra} more lines)${C.reset}`,
+        ]);
+    }
+    return lines;
+}
+
+// 헤더 키 정렬 + dim 컬러
+function headerLines(headers) {
+    if (!headers) return [];
+    const keys = Object.keys(headers);
+    if (keys.length === 0) return [];
+    const maxKey = Math.min(24, keys.reduce((m, k) => Math.max(m, k.length), 0));
+    return keys.map(k => {
+        const pad = k.length < maxKey ? ' '.repeat(maxKey - k.length) : '';
+        return `${C.dim}${k}:${pad} ${headers[k]}${C.reset}`;
+    });
+}
+
+function httpBarColor(payload) {
+    if (payload.event === 'request') return C.yel;
+    if (payload.event === 'response') return payload.code < 400 ? C.green : C.red;
+    if (payload.event === 'failed') return C.red;
+    return C.dim;
+}
+
+function printHttpBlock(payload) {
+    const b = httpBarColor(payload);
+    let title;
+
+    if (payload.event === 'request') {
+        title = `${C.yel}${C.bold}HTTP${C.reset} ${C.yel}→${C.reset} ${C.bold}${payload.method}${C.reset} ${payload.url}`;
+    } else if (payload.event === 'response') {
+        const codeColor = payload.code < 400 ? C.green : C.red;
+        title = `${C.yel}${C.bold}HTTP${C.reset} ${codeColor}←${C.reset} ${codeColor}${C.bold}${payload.code}${C.reset} ${payload.url}`;
+    } else if (payload.event === 'failed') {
+        title = `${C.yel}${C.bold}HTTP${C.reset} ${C.red}✗${C.reset} ${C.bold}${payload.method}${C.reset} ${payload.url}`;
+    } else {
+        printBox(b, `${C.yel}${C.bold}HTTP${C.reset} ${C.dim}${payload.event}${C.reset} ${payload.url || ''}`, []);
+        return;
+    }
+
+    const content = [];
+    const hdrs = headerLines(payload.headers);
+    if (hdrs.length) {
+        for (const h of hdrs) content.push(h);
+    }
+
+    if (payload.event === 'failed' && payload.error) {
+        if (content.length) content.push('');
+        content.push(`${C.red}${payload.error}${C.reset}`);
+    } else {
+        const body = bodyToLines(payload.body);
+        if (body.length) {
+            if (content.length) content.push('');
+            for (const bl of body) content.push(bl);
+        }
+    }
+
+    printBox(b, title, content);
+}
+
+function locoBarColor(ev) {
+    if (ev === 'send') return C.yel;
+    if (ev === 'recv') return C.green;
+    if (ev === 'push') return C.mag;
+    if (ev === 'connect' || ev === 'socket_connect') return C.cyan;
+    if (ev === 'disconnect' || ev === 'socket_close') return C.dim;
+    return C.cyan;
+}
+
+function locoMeta(payload) {
+    const parts = [];
+    if (payload.packetId != null && payload.packetId !== -1) parts.push(`pid=${payload.packetId}`);
+    if (payload.status != null && payload.status !== -1 && payload.status !== 0) parts.push(`st=${payload.status}`);
+    if (payload.bodyLength != null && payload.bodyLength !== -1) parts.push(`${payload.bodyLength}B`);
+    return parts.length ? ` ${C.dim}${parts.join(' ')}${C.reset}` : '';
+}
+
+function printLocoBlock(payload) {
+    const ev = payload.event;
+    const b = locoBarColor(ev);
+    const m = payload.method || '?';
+    const meta = locoMeta(payload);
+    let title;
+
+    if (ev === 'send') {
+        title = `${C.cyan}${C.bold}LOCO${C.reset} ${C.yel}→${C.reset} ${C.bold}${m}${C.reset}${meta}`;
+    } else if (ev === 'recv') {
+        title = `${C.cyan}${C.bold}LOCO${C.reset} ${C.green}←${C.reset} ${C.bold}${m}${C.reset}${meta}`;
+    } else if (ev === 'push') {
+        title = `${C.cyan}${C.bold}LOCO${C.reset} ${C.mag}◀${C.reset} ${C.bold}${C.mag}PUSH ${m}${C.reset}${meta}`;
+    } else if (ev === 'connect' || ev === 'socket_connect') {
+        const to = payload.timeout ? ` ${C.dim}timeout=${payload.timeout}ms${C.reset}` : '';
+        printEvent(C.cyan, 'LOCO', `${C.green}●${C.reset} ${C.dim}connect${C.reset} ${payload.host || ''}${to}`);
+        return;
+    } else if (ev === 'disconnect' || ev === 'socket_close') {
+        printEvent(C.cyan, 'LOCO', `${C.red}○${C.reset} ${C.dim}disconnected${C.reset}`);
+        return;
+    } else {
+        printEvent(C.cyan, 'LOCO', `${ev || 'event'}`);
+        return;
+    }
+
+    const body = bodyToLines(payload.body);
+    printBox(b, title, body);
+}
+
 // 모듈 파일 로드 순서 (의존성 순)
 const SCRIPT_MODULES = [
     // bypass 모듈
@@ -100,147 +357,17 @@ function setupMessageHandler(script) {
                     break;
                 }
                 case 'activity':
-                    console.log(`  [Activity] ${payload.event}: ${payload.name}`);
+                    printEvent(C.blue, 'Activity', `${payload.event} ${C.reset}${payload.name}${C.dim}`);
                     break;
                 case 'sharedpref':
-                    console.log(`  [SharedPref] ${payload.key} = ${payload.value}`);
+                    printEvent(C.mag, 'SharedPref', `${payload.key} ${C.reset}=${C.dim} ${payload.value == null ? 'null' : payload.value}`);
                     break;
                 case 'http': {
-                    const PAD_HTTP = '          ';
-                    const prettyHttpBody = (body) => {
-                        if (!body) return null;
-                        const s = typeof body === 'string' ? body : JSON.stringify(body);
-                        try {
-                            const parsed = JSON.parse(s);
-                            const json = JSON.stringify(parsed, null, 2);
-                            return json.split('\n').map((line, i) => i === 0 ? line : PAD_HTTP + line).join('\n');
-                        } catch (_) {
-                            return s;
-                        }
-                    };
-                    const printHeaders = (headers) => {
-                        if (!headers) return;
-                        for (const [k, v] of Object.entries(headers)) {
-                            console.log(`${PAD_HTTP}\x1b[2m${k}: ${v}\x1b[0m`);
-                        }
-                    };
-                    if (payload.event === 'request') {
-                        console.log(`  \x1b[33m[HTTP]\x1b[0m \x1b[33m→\x1b[0m \x1b[1m${payload.method}\x1b[0m ${payload.url}`);
-                        printHeaders(payload.headers);
-                        const rb = prettyHttpBody(payload.body);
-                        if (rb) console.log(`${PAD_HTTP}${rb}`);
-                    } else if (payload.event === 'response') {
-                        const codeColor = payload.code < 400 ? '\x1b[32m' : '\x1b[31m';
-                        console.log(`  \x1b[33m[HTTP]\x1b[0m \x1b[32m←\x1b[0m ${codeColor}${payload.code}\x1b[0m ${payload.url}`);
-                        printHeaders(payload.headers);
-                        const rb = prettyHttpBody(payload.body);
-                        if (rb) console.log(`${PAD_HTTP}${rb}`);
-                    } else {
-                        console.log(`  \x1b[33m[HTTP]\x1b[0m ${payload.event}: ${payload.url}`);
-                    }
+                    printHttpBlock(payload);
                     break;
                 }
                 case 'loco': {
-                    const ev = payload.event;
-                    const PAD = '           '; // 11칸 들여쓰기
-
-                    // body 포맷: 컬러 + Long 구분 + 컴팩트
-                    const colorVal = (v) => {
-                        if (v === null || v === undefined) return '\x1b[2mnull\x1b[0m';
-                        if (typeof v === 'boolean') return v ? '\x1b[33mtrue\x1b[0m' : '\x1b[33mfalse\x1b[0m';
-                        if (typeof v === 'number') {
-                            // Long-like (> 10자리) → 다른 색
-                            if (Math.abs(v) > 9999999999) return `\x1b[35m${v}\x1b[0m`;
-                            return `\x1b[36m${v}\x1b[0m`;
-                        }
-                        if (typeof v === 'string') {
-                            return `\x1b[32m"${v}"\x1b[0m`;
-                        }
-                        return String(v);
-                    };
-
-                    const formatBody = (body, indent) => {
-                        if (!body) return null;
-                        if (typeof body === 'string') {
-                            return body;
-                        }
-                        indent = indent || 0;
-                        const prefix = PAD + '  '.repeat(indent);
-                        if (Array.isArray(body)) {
-                            if (body.length === 0) return '[]';
-                            // 짧은 primitive 배열은 한줄로
-                            if (body.length <= 5 && body.every(v => typeof v !== 'object' || v === null)) {
-                                return '[' + body.map(v => colorVal(v)).join(', ') + ']';
-                            }
-                            const lines = body.map(v => {
-                                if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-                                    return prefix + '  ' + formatBody(v, indent + 1);
-                                }
-                                return prefix + '  ' + colorVal(v);
-                            });
-                            return '[\n' + lines.join(',\n') + '\n' + prefix + ']';
-                        }
-                        if (typeof body === 'object') {
-                            const keys = Object.keys(body);
-                            if (keys.length === 0) return '{}';
-                            // 키-값 쌍이 적고 값이 짧으면 한줄로
-                            const isCompact = keys.length <= 4 && keys.every(k => {
-                                const v = body[k];
-                                return v === null || typeof v !== 'object';
-                            });
-                            if (isCompact) {
-                                const pairs = keys.map(k => `\x1b[37m${k}\x1b[0m=${colorVal(body[k])}`);
-                                return '{ ' + pairs.join(', ') + ' }';
-                            }
-                            const lines = keys.map(k => {
-                                const v = body[k];
-                                if (typeof v === 'object' && v !== null) {
-                                    return prefix + '  ' + `\x1b[37m${k}\x1b[0m: ` + formatBody(v, indent + 1);
-                                }
-                                return prefix + '  ' + `\x1b[37m${k}\x1b[0m: ` + colorVal(v);
-                            });
-                            return '{\n' + lines.join(',\n') + '\n' + prefix + '}';
-                        }
-                        return colorVal(body);
-                    };
-
-                    const printBody = (body) => {
-                        const formatted = formatBody(body);
-                        if (formatted) console.log(`${PAD}${formatted}`);
-                    };
-
-                    if (ev === 'send') {
-                        const m = payload.method || '?';
-                        const parts = [];
-                        if (payload.packetId != null && payload.packetId !== -1) parts.push(`pid=${payload.packetId}`);
-                        if (payload.bodyLength != null && payload.bodyLength !== -1) parts.push(`${payload.bodyLength}B`);
-                        const suffix = parts.length ? ` \x1b[2m${parts.join(' ')}\x1b[0m` : '';
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m \x1b[33m→\x1b[0m \x1b[1m${m}\x1b[0m${suffix}`);
-                        printBody(payload.body);
-                    } else if (ev === 'recv') {
-                        const m = payload.method || '?';
-                        const parts = [];
-                        if (payload.packetId != null && payload.packetId !== -1) parts.push(`pid=${payload.packetId}`);
-                        if (payload.status != null && payload.status !== -1 && payload.status !== 0) parts.push(`st=${payload.status}`);
-                        if (payload.bodyLength != null && payload.bodyLength !== -1) parts.push(`${payload.bodyLength}B`);
-                        const suffix = parts.length ? ` \x1b[2m${parts.join(' ')}\x1b[0m` : '';
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m \x1b[32m←\x1b[0m \x1b[1m${m}\x1b[0m${suffix}`);
-                        printBody(payload.body);
-                    } else if (ev === 'push') {
-                        const m = payload.method || '?';
-                        const parts = [];
-                        if (payload.packetId != null) parts.push(`pid=${payload.packetId}`);
-                        if (payload.bodyLength != null) parts.push(`${payload.bodyLength}B`);
-                        const suffix = parts.length ? ` \x1b[2m${parts.join(' ')}\x1b[0m` : '';
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m \x1b[35m◀\x1b[0m \x1b[1;35mPUSH ${m}\x1b[0m${suffix}`);
-                        printBody(payload.body);
-                    } else if (ev === 'connect' || ev === 'socket_connect') {
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m \x1b[32m●\x1b[0m ${payload.host}${payload.timeout ? ` \x1b[2mtimeout=${payload.timeout}ms\x1b[0m` : ''}`);
-                    } else if (ev === 'disconnect' || ev === 'socket_close') {
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m \x1b[31m○\x1b[0m disconnected`);
-                    } else {
-                        console.log(`  \x1b[36m[LOCO]\x1b[0m ${ev || 'event'} ${JSON.stringify(payload)}`);
-                    }
+                    printLocoBlock(payload);
                     break;
                 }
                 default:

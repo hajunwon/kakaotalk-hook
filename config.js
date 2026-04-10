@@ -18,6 +18,7 @@ const DEFAULTS = {
   fridaServerPath: '',
   logLevel: 'info',
   scripts: {
+    'loader':        { enabled: true,  logLevel: 'info' },
     'anti-detect':   { enabled: true,  logLevel: 'info' },
     'anti-kill':     { enabled: true,  logLevel: 'info' },
     'nfilter':       { enabled: true,  logLevel: 'info' },

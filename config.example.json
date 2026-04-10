@@ -4,6 +4,7 @@
   "fridaServerPath": "",
   "logLevel": "info",
   "scripts": {
+    "loader":        { "enabled": true,  "logLevel": "info" },
     "anti-detect":   { "enabled": true,  "logLevel": "info" },
     "anti-kill":     { "enabled": true,  "logLevel": "info" },
     "nfilter":       { "enabled": true,  "logLevel": "info" },
@@ -12,7 +13,7 @@
     "sharedpref":    { "enabled": true,  "logLevel": "info" },
     "kakaotalk-app": { "enabled": true,  "logLevel": "info" },
     "loco-monitor":  { "enabled": true,  "logLevel": "info" },
-    "http-monitor":  { "enabled": true,  "logLevel": "debug" }
+    "http-monitor":  { "enabled": true,  "logLevel": "info"  }
   },
   "deviceSpoof": {
     "model":        "SM-S928N",

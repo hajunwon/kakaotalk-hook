@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { CONFIG_PATH, getDefaults, saveConfig, loadConfig } from './config.js';
 
 const SCRIPT_NAMES = [
+  'loader',
   'anti-detect', 'anti-kill', 'nfilter', 'device-spoof',
   'activity', 'sharedpref', 'kakaotalk-app', 'loco-monitor', 'http-monitor',
 ];
