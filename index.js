@@ -5,6 +5,8 @@ import { listDevices, selectDevice, shell } from './adb/device-manager.js';
 import { deployAndStart, stopServer } from './adb/frida-server.js';
 import { spawnAndHook, attachAndHook } from './frida/script-manager.js';
 import { promptAndInstall } from './adb/xapk-installer.js';
+import { promptAndExtract } from './adb/apk-extractor.js';
+import { scanPorts, identifyConnections, adbDisconnect } from './adb/device-scanner.js';
 
 const BANNER = `
   ╔══════════════════════════════════════╗
@@ -108,6 +110,75 @@ async function installApk() {
   await promptAndInstall(serial);
 }
 
+async function extractApk() {
+  const serial = await selectDevice();
+  await promptAndExtract(serial);
+}
+
+async function scanDevices() {
+  console.log('');
+  const results = await scanPorts({
+    onProgress: msg => console.log(`  ${msg}`),
+  });
+
+  const connected = results.filter(r => r.connected);
+  const openButFailed = results.filter(r => r.open && !r.connected && r.port !== 5037);
+
+  console.log('');
+  if (connected.length === 0) {
+    console.log('  연결에 성공한 포트 없음.');
+  } else {
+    console.log(`  ✓ 연결 성공 ${connected.length}개. 디바이스 식별 중...`);
+    const groups = await identifyConnections(results);
+
+    console.log(`\n  고유 디바이스 ${groups.length}개:`);
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      const id = g[0].identity;
+      const label = [id.manufacturer, id.model].filter(Boolean).join(' ') || '(unknown)';
+      const keyHint = id.serialno || id.mac || id.key;
+      console.log(`\n    #${i + 1} ${label}  (id: ${keyHint})`);
+      for (const e of g) {
+        const marker = e === g[0] ? '→' : ' ';
+        console.log(`      ${marker} 127.0.0.1:${e.port}  — ${e.label}`);
+      }
+      if (g.length > 1) {
+        console.log(`      ↑ ${g.length - 1}개가 동일 디바이스로의 중복 연결`);
+      }
+    }
+
+    const duplicates = groups.flatMap(g => g.slice(1));
+    if (duplicates.length > 0) {
+      const { cleanup } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'cleanup',
+        message: `중복 연결 ${duplicates.length}개를 disconnect 하시겠습니까?`,
+        default: true,
+      }]);
+      if (cleanup) {
+        for (const d of duplicates) {
+          const ok = await adbDisconnect(d.endpoint);
+          console.log(`    ${ok ? '✓' : '✗'} disconnect ${d.endpoint}`);
+        }
+      }
+    }
+  }
+
+  if (openButFailed.length > 0) {
+    console.log(`\n  ⚠ 포트는 열려있으나 adb connect 실패 ${openButFailed.length}개:`);
+    for (const r of openButFailed) {
+      console.log(`    127.0.0.1:${r.port}  — ${r.label}${r.message ? '  (' + r.message + ')' : ''}`);
+    }
+  }
+
+  const devices = await listDevices();
+  console.log(`\n  현재 adb devices (${devices.length}개):`);
+  for (const d of devices) {
+    console.log(`    ${d.serial}  [${d.status}]`);
+  }
+  console.log();
+}
+
 async function stopFrida() {
   const serial = await selectDevice();
   await stopServer(serial);
@@ -130,20 +201,24 @@ async function main() {
       pageSize: 20,
       choices: [
         { name: '1. 디바이스 목록 보기', value: 'devices' },
-        { name: '2. APK/XAPK/Split APK 설치', value: 'apk' },
-        { name: '3. frida-server 설치 및 실행', value: 'install' },
-        { name: '4. Hook (Spawn / Attach)', value: 'hook' },
-        { name: '5. frida-server 중지', value: 'stop' },
+        { name: '2. 디바이스 자동 스캔 (에뮬레이터/TCP ADB 포트)', value: 'scan' },
+        { name: '3. APK/XAPK/Split APK 설치', value: 'apk' },
+        { name: '4. APK/Split APK 추출 (Device → Local)', value: 'extract' },
+        { name: '5. frida-server 설치 및 실행', value: 'install' },
+        { name: '6. Hook (Spawn / Attach)', value: 'hook' },
+        { name: '7. frida-server 중지', value: 'stop' },
         new inquirer.Separator(),
-        { name: '6. 설정 변경', value: 'setup' },
-        { name: '7. 종료', value: 'exit' },
+        { name: '8. 설정 변경', value: 'setup' },
+        { name: '9. 종료', value: 'exit' },
       ],
     }]);
 
     try {
       switch (action) {
         case 'devices': await showDevices(); break;
+        case 'scan': await scanDevices(); break;
         case 'apk': await installApk(); break;
+        case 'extract': await extractApk(); break;
         case 'install': await installFridaServer(); break;
         case 'hook': await hookMenu(); break;
         case 'stop': await stopFrida(); break;

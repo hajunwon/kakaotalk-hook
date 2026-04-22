@@ -13,6 +13,9 @@ config.json
 .cache/
 *.tsbuildinfo
 
+# Extracted APKs
+extracted/
+
 # OS files
 Thumbs.db
 Desktop.ini
